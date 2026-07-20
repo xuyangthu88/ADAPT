@@ -1,6 +1,15 @@
 # ADAPT
 Code for paper ADAPT
 
+
+<p align="center">
+  <img src="framework.png" alt="ADAPT framework" width="900"/>
+</p>
+
+<p align="center">
+  <em>Figure 1: Overview of the proposed ADAPT framework.</em>
+</p>
+
 ## Installation
 
 ### 1. Clone the repository
@@ -42,23 +51,18 @@ export EPLUS_PATH={your energyplus path}
 
 ## Training
 
-### Train the diffusion IEWM
+### Train the physics-aware diffusion IEWM
 
 ```bash
-python scripts/train_iewm.py \
-  --config configs/iewm_diffusion.yaml
+python scripts/train.py
 ```
 
 ### Train RL with the world model
 
 ```bash
-python scripts/train_adapt.py \
-  --config configs/adapt_bdq.yaml
+python adapt.py \
+  --forecast_checkpoint ${ckpt_path}
+  --forecast_config ${config_path}
+  --forecast_model_type "DiffusionWM"
 ```
 
-### Evaluate a trained policy
-
-```bash
-python scripts/evaluate.py \
-  --checkpoint results/adapt/model.pt
-```
