@@ -3,15 +3,12 @@ import random
 import sys
 import time
 import json
-import csv
-import glob
 import re
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional, Sequence, List, Tuple
+from typing import Any, Optional, Sequence, Tuple
 from collections.abc import Sequence as ABCSequence
 
 import gym
@@ -183,9 +180,6 @@ class Args:
     forecast_N: int = 3
     forecast_F_in: int = 50
     forecast_model_type: str = "DiffusionWM"
-
-    eval_after_train: bool = True
-    eval_save_plots: bool = True
 
 
 def _forecast_model_type_is_diffusion(model_type: str) -> bool:
@@ -925,247 +919,6 @@ def polyak_update(source: nn.Module, target: nn.Module, tau: float):
         tgt.data.copy_(tau * src.data + (1.0 - tau) * tgt.data)
 
 
-def collect_eval_checkpoints(model_dir: str) -> List[Tuple[str, str]]:
-    """Collect best, final, and intermediate training checkpoints for evaluation."""
-    candidates: List[Tuple[str, str]] = []
-    best_path = os.path.join(model_dir, "best_model.pt")
-    if os.path.exists(best_path):
-        candidates.append(("best", best_path))
-    final_path = os.path.join(model_dir, "final_model.pt")
-    if os.path.exists(final_path):
-        candidates.append(("final", final_path))
-
-    step_ckpts: List[Tuple[int, str]] = []
-    for path in glob.glob(os.path.join(model_dir, "checkpoint_step_*.pt")):
-        match = re.search(r"checkpoint_step_(\d+)\.pt$", path)
-        if match:
-            step_ckpts.append((int(match.group(1)), path))
-    for step, path in sorted(step_ckpts, key=lambda item: item[0]):
-        candidates.append((f"ckpt_{step}", path))
-    return candidates
-
-
-def evaluate_policy_checkpoint(
-    checkpoint_path: str,
-    checkpoint_label: str,
-    args: Args,
-    device: torch.device,
-    forecaster,
-    history_len: int,
-    obs_dim: int,
-    extended_dim: int,
-    action_nvec: Sequence[int],
-    activation_cls: nn.Module,
-    run_name: str,
-) -> Tuple[float, float, float, float]:
-    """Run one greedy eval episode and return energy / PMV / PPD / smoothness."""
-    import SemiPhysBuildingSim
-
-    env = gym.make(
-        args.env_id,
-        reward_mode=args.reward_mode,
-        tradeoff_constant=args.tradeoff_constant,
-        eval_mode=True,
-        USE_Multi_Discrete=True,
-    )
-    env = FrameSkip(env, skip=args.frame_skip)
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    q_network = BDQNetwork(
-        obs_dim, extended_dim, action_nvec, args.net_arch, activation_cls
-    ).to(device)
-    q_network.load_state_dict(checkpoint["q_network"])
-    q_network.eval()
-
-    reset_forecaster_state(forecaster)
-
-    reset_result = env.reset()
-    obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-    obs = np.asarray(obs, dtype=np.float32)
-    prev_action = zero_action(env.action_space)
-    obs_history: deque[np.ndarray] = deque(maxlen=history_len)
-    for _ in range(history_len):
-        obs_history.append(obs.copy())
-    history_pre = np.stack(list(obs_history), axis=0)
-    future_feature = flatten_future_obs(
-        predict_future_with_history(
-            forecaster, history_pre, obs, prev_action, args.fore_step
-        ),
-        args,
-    )
-    extended_obs = np.concatenate([obs, future_feature], axis=-1)
-
-    action_list = []
-    done = False
-    while not done:
-        with torch.no_grad():
-            obs_tensor = torch.as_tensor(
-                extended_obs, dtype=torch.float32, device=device
-            ).unsqueeze(0)
-            q_values = q_network(obs_tensor)
-            action = torch.argmax(q_values, dim=2).squeeze(0).cpu().numpy().astype(np.int64)
-        action_list.append(action.copy())
-        action_python = to_python_action(action)
-        history_pre = np.stack(list(obs_history), axis=0)
-
-        step_result = env.step(action)
-        if len(step_result) == 5:
-            obs, _, terminated, truncated, _ = step_result
-            done = bool(terminated or truncated)
-        else:
-            obs, _, done, _ = step_result
-            done = bool(done)
-        obs = np.asarray(obs, dtype=np.float32)
-
-        if not done:
-            future_feature_next = flatten_future_obs(
-                predict_future_with_history(
-                    forecaster, history_pre, obs, action_python, args.fore_step
-                ),
-                args,
-            )
-            extended_obs = np.concatenate([obs, future_feature_next], axis=-1)
-            obs_history.append(obs.copy())
-        else:
-            extended_obs = np.concatenate(
-                [obs, np.zeros(args.fore_step * args.obs_dim_no_fan, dtype=np.float32)], axis=-1
-            )
-
-    reset_forecaster_state(forecaster)
-
-    smoothness_values = []
-    if len(action_list) > 1:
-        action_array = np.asarray(action_list, dtype=np.float32)
-        action_diff = np.diff(action_array, axis=0)
-        smoothness_values = np.sum(np.square(action_diff), axis=1).tolist()
-    smoothness_mean = float(np.mean(smoothness_values)) if smoothness_values else 0.0
-
-    data_recorder = env.data_recorder
-    energy_cost = float(np.sum(data_recorder["training"]["energy_consumption"]))
-    mean_pmv = float(np.mean(data_recorder["training"]["mean_pmv"]))
-    mean_ppd = float(np.mean(data_recorder["training"]["mean_ppd"]))
-
-    if args.eval_save_plots:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        plot_dir = os.path.join(os.path.dirname(checkpoint_path), "eval_plots")
-        os.makedirs(plot_dir, exist_ok=True)
-        fig, axes = plt.subplots(3, 4, figsize=(24, 18))
-        fig.suptitle(f"{run_name} | {checkpoint_label}", fontsize=16)
-        axes = axes.flatten()
-        outdoor_temp = data_recorder["sensor_outdoor"]["outdoor_temp"]
-        for i in range(7):
-            ax = axes[i]
-            room_str = f"room{i + 1}"
-            room_temp = data_recorder[room_str]["room_temp"]
-            ax.plot(room_temp, marker="o", linestyle="-", color="b", label="Temperature")
-            ax.plot(
-                outdoor_temp,
-                marker="o",
-                linestyle="-",
-                color="r",
-                label="Outdoor Temperature",
-            )
-            ax.set_title(room_str)
-            ax.grid(True, linestyle="--", linewidth=0.5, color="gray")
-        axes[7].plot(smoothness_values, color="orange")
-        axes[7].set_title(f"Smoothness Mean: {smoothness_mean:.2f}")
-        axes[8].plot(data_recorder["training"]["reward"], color="g")
-        axes[9].plot(data_recorder["training"]["energy_consumption"], color="g")
-        axes[10].plot(data_recorder["training"]["mean_pmv"], color="g")
-        axes[11].plot(data_recorder["training"]["mean_ppd"], color="g")
-        plt.tight_layout()
-        safe_label = checkpoint_label.replace("/", "_")
-        plt.savefig(os.path.join(plot_dir, f"{safe_label}.png"), dpi=150, bbox_inches="tight")
-        plt.close()
-
-    env.close()
-    return energy_cost, mean_pmv, mean_ppd, smoothness_mean
-
-
-def run_post_train_evaluation(
-    args: Args,
-    model_dir: str,
-    run_name: str,
-    device: torch.device,
-    forecaster,
-    history_len: int,
-    obs_dim: int,
-    extended_dim: int,
-    action_nvec: Sequence[int],
-    activation_cls: nn.Module,
-) -> List[Tuple[str, float, float, float, float]]:
-    checkpoints = collect_eval_checkpoints(model_dir)
-    if not checkpoints:
-        print("No checkpoints found for post-training evaluation.")
-        return []
-
-    log_path = os.path.join(model_dir, "eval_log.txt")
-    csv_path = os.path.join(model_dir, "eval_results.csv")
-    results: List[Tuple[str, float, float, float, float]] = []
-
-    with open(log_path, "w", encoding="utf-8") as log_file:
-        log_file.write(f"run_name: {run_name}\n")
-        log_file.write(f"timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        log_file.write(
-            "checkpoint | energy_cost | mean_pmv | mean_ppd | mean_smoothness\n"
-        )
-
-        for checkpoint_label, checkpoint_path in checkpoints:
-            try:
-                energy_cost, mean_pmv, mean_ppd, mean_smoothness = evaluate_policy_checkpoint(
-                    checkpoint_path,
-                    checkpoint_label,
-                    args,
-                    device,
-                    forecaster,
-                    history_len,
-                    obs_dim,
-                    extended_dim,
-                    action_nvec,
-                    activation_cls,
-                    run_name,
-                )
-                results.append(
-                    (checkpoint_label, energy_cost, mean_pmv, mean_ppd, mean_smoothness)
-                )
-                line = (
-                    f"{checkpoint_label} | {energy_cost:.4f} | {mean_pmv:.4f} | "
-                    f"{mean_ppd:.4f} | {mean_smoothness:.4f}\n"
-                )
-                log_file.write(line)
-                print(
-                    f"[eval] {checkpoint_label}: energy={energy_cost:.2f}, "
-                    f"pmv={mean_pmv:.4f}, ppd={mean_ppd:.4f}, smoothness={mean_smoothness:.4f}"
-                )
-            except Exception as exc:
-                log_file.write(f"{checkpoint_label} | ERROR | {exc}\n")
-                print(f"[eval] Failed on {checkpoint_label}: {exc}")
-
-    with open(csv_path, "w", encoding="utf-8", newline="") as csv_file:
-        writer = csv.writer(csv_file)
-        writer.writerow(
-            ["checkpoint", "energy_cost", "mean_pmv", "mean_ppd", "mean_smoothness"]
-        )
-        for checkpoint_label, energy_cost, mean_pmv, mean_ppd, mean_smoothness in results:
-            writer.writerow(
-                [
-                    checkpoint_label,
-                    f"{energy_cost:.6f}",
-                    f"{mean_pmv:.6f}",
-                    f"{mean_ppd:.6f}",
-                    f"{mean_smoothness:.6f}",
-                ]
-            )
-
-    print(f"Evaluation log saved to {log_path}")
-    print(f"Evaluation csv saved to {csv_path}")
-    return results
-
-
 if __name__ == "__main__":
     args = tyro.cli(Args)
     run_name = (
@@ -1467,25 +1220,5 @@ if __name__ == "__main__":
         )
         print(f"Final model saved to {final_model_path}")
 
-    if args.eval_after_train:
-        run_post_train_evaluation(
-            args,
-            model_dir,
-            run_name,
-            device,
-            forecaster,
-            history_len,
-            obs_dim,
-            extended_dim,
-            action_nvec,
-            activation_cls,
-        )
-
     envs.close()
     writer.close()
-
-
-
-
-
-
