@@ -20,7 +20,6 @@ import torch.optim as optim
 import tyro
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrl_utils.buffers import ReplayBuffer
 from tsfm_handle import KEEP_IDX_NO_FAN
 from forecast import (
     OBS_DIM,
@@ -113,6 +112,11 @@ class BDQNetwork(nn.Module):
         q_value = value.unsqueeze(2) + advs - advs.mean(2, keepdim=True)
         return q_value
 
+    def value(self, obs: torch.Tensor) -> torch.Tensor:
+        """V_psi(obs) from current observation only; obs shape (batch, observation_dim)."""
+        value_out = self.value_representation(obs)
+        return self.value_head(value_out)
+
 
 def serialize_args(args) -> dict:
     """Convert cli args to JSON-safe primitives."""
@@ -150,6 +154,9 @@ class Args:
     num_envs: int = 1
     buffer_size: int = 500000
     gamma: float = 0.99
+    # V-bootstrapped action-held TD(lambda): horizon H and trace decay lambda
+    td_lambda: float = 0.8
+    bootstrap_horizon: int = 3
     tau: float = 1.0
     target_network_frequency: int = 1000
     batch_size: int = 64
@@ -919,6 +926,186 @@ def polyak_update(source: nn.Module, target: nn.Module, tau: float):
         tgt.data.copy_(tau * src.data + (1.0 - tau) * tgt.data)
 
 
+def unwrap_semi_phys(gym_env):
+    e = gym_env
+    seen = set()
+    while id(e) not in seen:
+        seen.add(id(e))
+        if hasattr(e, "estimate_rewards_from_observations"):
+            return e
+        if hasattr(e, "env"):
+            e = e.env
+        elif hasattr(e, "unwrapped"):
+            nxt = e.unwrapped
+            if nxt is e:
+                break
+            e = nxt
+        else:
+            break
+    raise RuntimeError("SemiPhysBuildingSimulation not found in env wrapper chain")
+
+
+class ReplayBatch:
+    def __init__(
+        self,
+        observations: torch.Tensor,
+        next_observations: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        future_observations: torch.Tensor,
+    ):
+        self.observations = observations
+        self.next_observations = next_observations
+        self.actions = actions
+        self.rewards = rewards
+        self.dones = dones
+        self.future_observations = future_observations
+
+
+class ContinuousHistoryReplayBuffer:
+    def __init__(
+        self,
+        buffer_size: int,
+        extended_dim: int,
+        action_dim: int,
+        obs_dim: int,
+        future_horizon: int,
+        device: torch.device,
+    ):
+        self.buffer_size = int(buffer_size)
+        self.device = device
+        self.pos = 0
+        self.full = False
+
+        self.observations = np.zeros((buffer_size, extended_dim), dtype=np.float32)
+        self.next_observations = np.zeros((buffer_size, extended_dim), dtype=np.float32)
+        self.actions = np.zeros((buffer_size, action_dim), dtype=np.int64)
+        self.rewards = np.zeros((buffer_size, 1), dtype=np.float32)
+        self.dones = np.zeros((buffer_size, 1), dtype=np.float32)
+        self.future_observations = np.zeros((buffer_size, future_horizon, obs_dim), dtype=np.float32)
+
+    def add(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        done: bool,
+        future_obs: np.ndarray,
+    ):
+        i = self.pos
+        self.observations[i] = np.asarray(obs, dtype=np.float32)
+        self.next_observations[i] = np.asarray(next_obs, dtype=np.float32)
+        self.actions[i] = np.asarray(action, dtype=np.int64).reshape(-1)
+        self.rewards[i, 0] = float(reward)
+        self.dones[i, 0] = float(done)
+        self.future_observations[i] = np.asarray(future_obs, dtype=np.float32)
+
+        self.pos = (self.pos + 1) % self.buffer_size
+        if self.pos == 0:
+            self.full = True
+
+    def size(self) -> int:
+        return self.buffer_size if self.full else self.pos
+
+    def sample(self, batch_size: int) -> ReplayBatch:
+        max_idx = self.size()
+        idx = np.random.randint(0, max_idx, size=int(batch_size))
+        return ReplayBatch(
+            observations=torch.as_tensor(self.observations[idx], device=self.device, dtype=torch.float32),
+            next_observations=torch.as_tensor(self.next_observations[idx], device=self.device, dtype=torch.float32),
+            actions=torch.as_tensor(self.actions[idx], device=self.device, dtype=torch.long),
+            rewards=torch.as_tensor(self.rewards[idx], device=self.device, dtype=torch.float32),
+            dones=torch.as_tensor(self.dones[idx], device=self.device, dtype=torch.float32),
+            future_observations=torch.as_tensor(self.future_observations[idx], device=self.device, dtype=torch.float32),
+        )
+
+
+def v_bootstrapped_td_lambda_targets(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    next_observations: torch.Tensor,
+    future_observations: torch.Tensor,
+    obs_dim: int,
+    spbs_env,
+    target_network: BDQNetwork,
+    gamma: float,
+    td_lambda: float,
+    bootstrap_horizon: int,
+    device: torch.device,
+    frame_skip: int = 1,
+) -> torch.Tensor:
+    """
+    Action-held multistep TD(lambda).
+    y^lambda = (1-lambda) * sum_{h=1}^{H-1} lambda^{h-1} y_h^V + lambda^{H-1} y_H^V,
+    with y_h^V = sum_{k=1}^h gamma^{k-1} r_hat_k + gamma^h V_bar(o_{t+h+1}).
+    r_hat_1 is the real transition reward; r_hat_{k>1} from spbs_env.estimate_rewards_from_observations
+    on rollout-cached world-model states (action held across the imagined horizon).
+    """
+    bsz = rewards.shape[0]
+    out = torch.zeros(bsz, 1, device=device, dtype=torch.float32)
+    next_obs_50 = next_observations[:, :obs_dim]
+    rewards_1d = rewards.view(-1).float()
+    dones_1d = dones.view(-1)
+    h = max(1, int(bootstrap_horizon))
+    gam = float(gamma)
+    lam = float(td_lambda)
+    fs = max(1.0, float(frame_skip))
+
+    terminal_mask = dones_1d > 0.5
+    out[:, 0] = rewards_1d
+    nonterm_idx = torch.where(~terminal_mask)[0]
+    if nonterm_idx.numel() == 0:
+        return out
+
+    next_np = next_obs_50[nonterm_idx].detach().cpu().numpy().astype(np.float32)
+    rewards_np = rewards_1d[nonterm_idx].detach().cpu().numpy().astype(np.float32)
+    n_nonterm = next_np.shape[0]
+
+    # Build bootstrap states from rollout-cached futures: [o_{t+1}, o_{t+2}, ..., o_{t+h}]
+    eval_states_np = np.zeros((n_nonterm, h, obs_dim), dtype=np.float32)
+    eval_states_np[:, 0] = next_np
+    if h > 1:
+        future_np = future_observations[nonterm_idx, : h - 1].detach().cpu().numpy().astype(np.float32)
+        eval_states_np[:, 1:] = future_np
+
+    # Vectorized reward/value computation.
+    r_hat_np = np.zeros((n_nonterm, h), dtype=np.float32)
+    r_hat_np[:, 0] = rewards_np
+    if h > 1:
+        imagined_states = eval_states_np[:, 1:, :].reshape(-1, obs_dim)
+        imagined_rewards = spbs_env.estimate_rewards_from_observations(imagined_states, smoothness=0.0)
+        scaled_imagined_rewards = np.asarray(imagined_rewards, dtype=np.float32) * fs
+        r_hat_np[:, 1:] = scaled_imagined_rewards.reshape(n_nonterm, h - 1)
+
+    with torch.no_grad():
+        eval_states_t = torch.as_tensor(eval_states_np, device=device, dtype=torch.float32)
+        v_boot = target_network.value(eval_states_t.reshape(-1, obs_dim)).reshape(n_nonterm, h)
+        r_hat_t = torch.as_tensor(r_hat_np, device=device, dtype=torch.float32)
+
+        gamma_pows = torch.pow(
+            torch.tensor(gam, device=device, dtype=torch.float32),
+            torch.arange(h, device=device, dtype=torch.float32),
+        )
+        disc_returns = torch.cumsum(r_hat_t * gamma_pows.unsqueeze(0), dim=1)
+        gamma_h = torch.pow(
+            torch.tensor(gam, device=device, dtype=torch.float32),
+            torch.arange(1, h + 1, device=device, dtype=torch.float32),
+        )
+        y_levels = disc_returns + gamma_h.unsqueeze(0) * v_boot
+
+        lambda_pows = torch.pow(
+            torch.tensor(lam, device=device, dtype=torch.float32),
+            torch.arange(h, device=device, dtype=torch.float32),
+        )
+        weights = (1.0 - lam) * lambda_pows
+        weights[-1] = lambda_pows[-1]
+        y_lam = torch.sum(y_levels * weights.unsqueeze(0), dim=1)
+        out[nonterm_idx, 0] = y_lam
+    return out
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     run_name = (
@@ -978,16 +1165,16 @@ if __name__ == "__main__":
     obs_dim = int(np.prod(envs.single_observation_space.shape))
     extended_dim = obs_dim + args.fore_step * args.obs_dim_no_fan
 
-    extended_space = gym.spaces.Box(
-        low=-np.inf, high=np.inf, shape=(extended_dim,), dtype=np.float32
-    )
-
-    rb = ReplayBuffer(
-        args.buffer_size,
-        extended_space,
-        envs.single_action_space,
-        device,
-        handle_timeout_termination=False,
+    action_dim = len(action_nvec)
+    bootstrap_horizon = max(1, int(args.bootstrap_horizon))
+    max_rollout_horizon = max(int(args.fore_step), bootstrap_horizon)
+    rb = ContinuousHistoryReplayBuffer(
+        buffer_size=args.buffer_size,
+        extended_dim=extended_dim,
+        action_dim=action_dim,
+        obs_dim=obs_dim,
+        future_horizon=max_rollout_horizon,
+        device=device,
     )
 
     model_dir = f"runs/{run_name}"
@@ -1008,6 +1195,7 @@ if __name__ == "__main__":
     obs, _ = envs.reset()
     obs = obs[0].astype(np.float32)
     forecaster, train_config_path = load_world_model_forecaster(args, device)
+    spbs_env = unwrap_semi_phys(envs.envs[0])
     if args.fore_step > forecaster.N:
         raise ValueError(
             f"--fore-step={args.fore_step} 大于模型预测步数 N={forecaster.N}，"
@@ -1077,27 +1265,31 @@ if __name__ == "__main__":
         batched_action = np.expand_dims(action_array, 0)
         history_pre = np.stack(list(obs_history), axis=0)
 
-        next_obs, rewards, dones, _, infos = envs.step(batched_action)
+        next_obs, rewards, dones, _, _ = envs.step(batched_action)
         next_obs = next_obs[0].astype(np.float32)
         reward = float(rewards[0])
         done = bool(dones[0])
 
-        future_feature_next = flatten_future_obs(
-            predict_future_with_history(
-                forecaster, history_pre, next_obs, action_python, args.fore_step
-            ),
-            args,
-        )
+        rollout_future = np.zeros((max_rollout_horizon, obs_dim), dtype=np.float32)
+        if not done:
+            rollout_future = predict_future_with_history(
+                forecaster,
+                history_pre,
+                next_obs,
+                action_python,
+                max_rollout_horizon,
+            )
+
+        future_feature_next = flatten_future_obs(rollout_future[: args.fore_step], args)
         extended_next_obs = np.concatenate([next_obs, future_feature_next], axis=-1)
 
-        infos_list = [infos[0]] if isinstance(infos, list) else [infos]
         rb.add(
             extended_obs,
             extended_next_obs,
             np.array(action_array, dtype=np.int64),
-            np.array(reward, dtype=np.float32),
-            np.array(done, dtype=np.float32),
-            infos_list,
+            reward,
+            done,
+            rollout_future,
         )
 
         extended_obs = extended_next_obs
@@ -1109,12 +1301,14 @@ if __name__ == "__main__":
                 obs_history.append(next_obs.copy())
             prev_action = zero_action(envs.single_action_space)
             reset_history_pre = np.stack(list(obs_history), axis=0)
-            reset_future_feature = flatten_future_obs(
-                predict_future_with_history(
-                    forecaster, reset_history_pre, next_obs, prev_action, args.fore_step
-                ),
-                args,
+            reset_future = predict_future_with_history(
+                forecaster,
+                reset_history_pre,
+                next_obs,
+                prev_action,
+                max_rollout_horizon,
             )
+            reset_future_feature = flatten_future_obs(reset_future[: args.fore_step], args)
             extended_obs = np.concatenate([next_obs, reset_future_feature], axis=-1)
             writer.add_scalar("charts/episodic_return", episode_return, global_step)
             if args.track:
@@ -1151,21 +1345,28 @@ if __name__ == "__main__":
             for _ in range(args.gradient_steps):
                 data = rb.sample(args.batch_size)
                 with torch.no_grad():
-                    next_q_values = q_network(data.next_observations)
-                    next_actions = torch.argmax(next_q_values, dim=2)
-                    target_next_q = target_network(data.next_observations)
-                    max_next_q = target_next_q.gather(2, next_actions.unsqueeze(2)).squeeze(-1)
-                    max_next_q = max_next_q.mean(1, keepdim=True)
-                    td_target = data.rewards + args.gamma * (1 - data.dones) * max_next_q
+                    td_target = v_bootstrapped_td_lambda_targets(
+                        data.rewards,
+                        data.dones,
+                        data.next_observations,
+                        data.future_observations,
+                        obs_dim,
+                        spbs_env,
+                        target_network,
+                        args.gamma,
+                        args.td_lambda,
+                        args.bootstrap_horizon,
+                        device,
+                        args.frame_skip,
+                    )
 
                 current_q_values = q_network(data.observations)
                 actions_tensor = data.actions.long().reshape(
                     data.observations.shape[0], -1, 1
                 )
                 current_q_values = current_q_values.gather(2, actions_tensor).squeeze(-1)
-                current_q_values = current_q_values.mean(1, keepdim=True)
-
-                loss = F.smooth_l1_loss(current_q_values, td_target)
+                branch_target = td_target.expand_as(current_q_values)
+                loss = F.mse_loss(current_q_values, branch_target)
                 if gradient_updates % 100 == 0:
                     writer.add_scalar("losses/td_loss", loss.item(), gradient_updates)
                     writer.add_scalar(
